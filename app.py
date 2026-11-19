@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import datetime
+import time
 
 import requests
 import streamlit as st
@@ -166,66 +167,143 @@ def notes_model_candidates(key):
     return candidates[:6]
 
 
-def make_notes_groq(user_text):
+PART_SYSTEM = NOTES_SYSTEM + """
+This is only part {i} of {n} of a longer recording. Write notes for this part only."""
+
+MERGE_SYSTEM = """You combine meeting notes written for consecutive parts of one long recording into a single set of notes.
+Rules:
+- Use ONLY the notes provided. Never add facts, names, numbers or dates.
+- Keep every decision, action item (with owner and due date if given) and open question. Remove duplicates.
+- Write one Summary of the whole recording in 4-6 sentences.
+- Use exactly the same format as the notes you are given: Summary, Key points, Decisions made, Action items, Open questions.
+- Write in simple, clear English."""
+
+PAUSE_SECONDS = 12         # short wait between requests to respect the free token limit
+MERGE_LIMIT_CHARS = 9000   # how much part-notes text we merge in one request
+
+
+def retry_wait(resp):
+    try:
+        seconds = float(resp.headers.get("retry-after", "") or 0)
+    except ValueError:
+        seconds = 0
+    return min(max(seconds, 8) + 1, 65)
+
+
+def groq_chat(system, user, max_tokens=2500):
     key = get_secret("GROQ_API_KEY")
     if not key:
         raise RuntimeError("GROQ_API_KEY is missing. Add it in secrets.")
     last_error = "No notes model is available on this Groq account."
     for model in notes_model_candidates(key):
-        payload = {
-            "model": model,
-            "temperature": 0,
-            "max_tokens": 4000,
-            "messages": [
-                {"role": "system", "content": NOTES_SYSTEM},
-                {"role": "user", "content": user_text},
-            ],
-        }
-        if model.startswith("openai/gpt-oss"):
-            payload["reasoning_effort"] = "low"
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json=payload,
-            timeout=300,
-        )
-        if resp.status_code == 200:
-            text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
-            if text:
-                return text
-            last_error = f"{model} returned empty notes."
-            continue
-        last_error = f"{model}: {resp.status_code} {resp.text[:200]}"
-        # Try the next model if this one is missing or not allowed
-        if resp.status_code in (400, 403, 404):
-            continue
-        break
+        for attempt in range(4):
+            payload = {
+                "model": model,
+                "temperature": 0,
+                "max_tokens": max_tokens,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            }
+            if model.startswith("openai/gpt-oss"):
+                payload["reasoning_effort"] = "low"
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json=payload,
+                timeout=300,
+            )
+            if resp.status_code == 200:
+                text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
+                if text:
+                    return text
+                last_error = f"{model} returned empty notes."
+                break
+            last_error = f"{model}: {resp.status_code} {resp.text[:200]}"
+            if resp.status_code == 401:
+                raise RuntimeError("Your Groq key was not accepted (401). Check GROQ_API_KEY in Secrets.")
+            if resp.status_code == 429 and attempt < 3:
+                time.sleep(retry_wait(resp))  # rate limit: wait, then try the same model again
+                continue
+            break  # otherwise move on to the next model
     raise RuntimeError(f"Notes failed. Last error: {last_error}")
 
 
-def make_notes(transcript, context):
-    user_text = ""
-    if context.strip():
-        user_text += f"Meeting context from the user:\n{context.strip()}\n\n"
-    user_text += f"Transcript:\n{transcript}"
+def split_transcript(transcript):
+    """Cut a long transcript into parts small enough for the free notes model."""
+    non_ascii = sum(1 for c in transcript if ord(c) > 127)
+    limit = 3000 if non_ascii / max(len(transcript), 1) > 0.3 else 8000
+    parts, current, size = [], [], 0
+    for line in transcript.splitlines():
+        pieces = [line[i:i + limit] for i in range(0, len(line), limit)] or [""]
+        for piece in pieces:
+            if current and size + len(piece) + 1 > limit:
+                parts.append("\n".join(current))
+                current, size = [], 0
+            current.append(piece)
+            size += len(piece) + 1
+    if current:
+        parts.append("\n".join(current))
+    return parts
+
+
+def merge_notes(notes_list, ctx, say):
+    level = list(notes_list)
+    while len(level) > 1:
+        total = sum(len(n) for n in level)
+        group_size = len(level) if total <= MERGE_LIMIT_CHARS else 3
+        next_level = []
+        for start in range(0, len(level), group_size):
+            group = level[start:start + group_size]
+            if len(group) == 1:
+                next_level.append(group[0])
+                continue
+            say("Combining the parts into final notes...")
+            time.sleep(PAUSE_SECONDS)
+            joined = "\n\n".join(f"### Notes for part {k}\n{t}" for k, t in enumerate(group, 1))
+            next_level.append(groq_chat(MERGE_SYSTEM, ctx + joined, 2500))
+        level = next_level
+    return level[0]
+
+
+def make_notes(transcript, context, progress=None):
+    say = progress or (lambda message: None)
+    ctx = f"Meeting context from the user:\n{context.strip()}\n\n" if context.strip() else ""
 
     key = get_secret("ANTHROPIC_API_KEY")
-    if not key:
-        # Free option: Groq writes the notes when no Anthropic key is set
-        return make_notes_groq(user_text)
+    if key:
+        import anthropic
 
-    import anthropic
+        model = get_secret("CLAUDE_MODEL") or "claude-sonnet-5-5"
+        client = anthropic.Anthropic(api_key=key)
+        msg = client.messages.create(
+            model=model,
+            max_tokens=3000,
+            temperature=0,
+            system=NOTES_SYSTEM,
+            messages=[{"role": "user", "content": ctx + f"Transcript:\n{transcript}"}],
+        )
+        return msg.content[0].text
 
-    model = get_secret("CLAUDE_MODEL") or "claude-sonnet-5-5"
-    client = anthropic.Anthropic(api_key=key)
-    msg = client.messages.create(
-        model=model,
-        max_tokens=2000,
-        temperature=0,
-        system=NOTES_SYSTEM,
-        messages=[{"role": "user", "content": user_text}],
-    )
-    return msg.content[0].text
+    # Free option: Groq writes the notes, in parts when the recording is long
+    parts = split_transcript(transcript)
+    if len(parts) == 1:
+        return groq_chat(NOTES_SYSTEM, ctx + f"Transcript:\n{transcript}", 2500)
+
+    partial = []
+    for i, part in enumerate(parts, 1):
+        say(f"Writing notes for part {i} of {len(parts)}...")
+        if i > 1:
+            time.sleep(PAUSE_SECONDS)
+        partial.append(
+            groq_chat(
+                PART_SYSTEM.format(i=i, n=len(parts)),
+                ctx + f"Transcript of part {i} of {len(parts)}:\n{part}",
+                1800,
+            )
+        )
+    return merge_notes(partial, ctx, say)
 
 
 # ---------- screen ----------
@@ -364,7 +442,9 @@ RECORDER_HTML = r'''<!doctype html>
     mime = pickMime();
     chunks = [];
     acc = 0;
-    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    var opts = { audioBitsPerSecond: 32000 };
+    if (mime) { opts.mimeType = mime; }
+    try { recorder = new MediaRecorder(stream, opts); } catch (e) { recorder = new MediaRecorder(stream); }
     recorder.ondataavailable = function (e) { if (e.data && e.data.size > 0) chunks.push(e.data); };
     recorder.onstop = finish;
     recorder.start(1000);
@@ -599,7 +679,7 @@ with tab_new:
                     st.warning("No speech was found in this audio.")
                 else:
                     st.write("Writing notes...")
-                    notes = make_notes(transcript, context)
+                    notes = make_notes(transcript, context, progress=st.write)
                     st.session_state["result"] = {
                         "title": title.strip() or "Untitled recording",
                         "transcript": transcript,
