@@ -4,7 +4,6 @@ import datetime
 
 import requests
 import streamlit as st
-import anthropic
 
 DB_FILE = "meetings.db"
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -125,16 +124,43 @@ def transcribe(audio_bytes, filename, language, vocab):
 
 
 # ---------- notes ----------
+def make_notes_groq(user_text):
+    key = get_secret("GROQ_API_KEY")
+    model = get_secret("GROQ_NOTES_MODEL") or "llama-3.3-70b-versatile"
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": model,
+            "temperature": 0,
+            "max_tokens": 2000,
+            "messages": [
+                {"role": "system", "content": NOTES_SYSTEM},
+                {"role": "user", "content": user_text},
+            ],
+        },
+        timeout=300,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Notes failed ({resp.status_code}): {resp.text[:300]}")
+    return resp.json()["choices"][0]["message"]["content"]
+
+
 def make_notes(transcript, context):
-    key = get_secret("ANTHROPIC_API_KEY")
-    if not key:
-        raise RuntimeError("ANTHROPIC_API_KEY is missing. Add it in secrets.")
-    model = get_secret("CLAUDE_MODEL") or "claude-sonnet-5-5"
-    client = anthropic.Anthropic(api_key=key)
     user_text = ""
     if context.strip():
         user_text += f"Meeting context from the user:\n{context.strip()}\n\n"
     user_text += f"Transcript:\n{transcript}"
+
+    key = get_secret("ANTHROPIC_API_KEY")
+    if not key:
+        # Free option: Groq writes the notes when no Anthropic key is set
+        return make_notes_groq(user_text)
+
+    import anthropic
+
+    model = get_secret("CLAUDE_MODEL") or "claude-sonnet-5-5"
+    client = anthropic.Anthropic(api_key=key)
     msg = client.messages.create(
         model=model,
         max_tokens=2000,
