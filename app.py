@@ -229,99 +229,240 @@ def make_notes(transcript, context):
 
 
 # ---------- screen ----------
+import re
+
 st.set_page_config(page_title="Meeting Notes Bot", page_icon="🎙️", layout="wide")
-st.title("🎙️ Meeting Notes Bot")
-st.caption("Record or upload a meeting. It writes the transcript and the notes.")
 
-tab_new, tab_history = st.tabs(["New meeting", "Saved meetings"])
+st.markdown(
+    """
+<style>
+#MainMenu, footer {visibility: hidden;}
+.block-container {padding-top: 1.6rem; max-width: 1100px;}
 
-with tab_new:
-    col1, col2 = st.columns(2)
-    with col1:
-        title = st.text_input("Meeting title", placeholder="Example: Weekly sales review")
-        language = st.selectbox("Language spoken", ["Auto-detect", "English", "Hindi", "Marathi"])
-    with col2:
-        vocab = st.text_area(
-            "Names and special words (improves accuracy)",
-            placeholder="Example: Responsive Industries, Power BI, DAX, Srinivas",
-            height=100,
-        )
-    context = st.text_input("Short context for the notes (optional)", placeholder="Example: Call with the export team")
+.hero {
+  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 45%, #ec4899 100%);
+  border-radius: 24px; padding: 30px 32px; margin-bottom: 22px;
+  box-shadow: 0 14px 34px rgba(124, 58, 237, 0.35);
+}
+.hero-title {font-size: 2.3rem; font-weight: 800; color: #ffffff; line-height: 1.15;}
+.hero-sub {font-size: 1.05rem; color: rgba(255,255,255,0.92); margin: 8px 0 16px 0;}
+.chip {
+  display: inline-block; padding: 6px 14px; margin: 0 8px 8px 0; border-radius: 999px;
+  background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.35);
+  color: #ffffff; font-size: 0.88rem; font-weight: 600;
+}
 
-    st.subheader("1. Add the audio")
-    recorded = st.audio_input("Record from your microphone")
-    uploaded = st.file_uploader(
-        "Or upload a recording (mp3, wav, m4a, mp4, webm)",
-        type=["mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac"],
+.step {display: flex; align-items: center; gap: 12px; margin: 4px 0 10px 0;}
+.step .num {
+  width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
+  background: linear-gradient(135deg, #6366f1, #ec4899); color: #ffffff;
+  display: flex; align-items: center; justify-content: center; font-weight: 800;
+  box-shadow: 0 4px 12px rgba(236, 72, 153, 0.35);
+}
+.step .label {font-size: 1.25rem; font-weight: 700;}
+
+div[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 18px;}
+
+.stButton > button, .stDownloadButton > button {
+  width: 100%; border-radius: 12px; font-weight: 600; padding: 0.6rem 1rem;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.stButton > button:hover, .stDownloadButton > button:hover {
+  transform: translateY(-2px); box-shadow: 0 8px 18px rgba(99, 102, 241, 0.28);
+}
+.stButton > button[kind="primary"], button[data-testid="stBaseButton-primary"] {
+  background: linear-gradient(135deg, #6366f1, #8b5cf6 50%, #ec4899);
+  color: #ffffff; border: none; font-size: 1.05rem; padding: 0.75rem 1rem;
+}
+.stButton > button[kind="primary"]:disabled, button[data-testid="stBaseButton-primary"]:disabled {
+  opacity: 0.45;
+}
+
+div[data-testid="stMetric"] {
+  background: rgba(127, 127, 127, 0.10); border: 1px solid rgba(127, 127, 127, 0.22);
+  padding: 14px 18px; border-radius: 16px;
+}
+button[data-baseweb="tab"] {font-size: 1.05rem; font-weight: 700;}
+.footer {text-align: center; opacity: 0.6; font-size: 0.9rem; margin-top: 28px;}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+def step(number, text):
+    st.markdown(
+        f'<div class="step"><div class="num">{number}</div><div class="label">{text}</div></div>',
+        unsafe_allow_html=True,
     )
 
-    audio_bytes, filename = None, None
-    if uploaded is not None:
-        audio_bytes, filename = uploaded.getvalue(), uploaded.name
-    elif recorded is not None:
-        audio_bytes, filename = recorded.getvalue(), "recording.wav"
 
-    if audio_bytes:
-        size_mb = len(audio_bytes) / (1024 * 1024)
-        st.write(f"Audio size: {size_mb:.1f} MB")
-        if size_mb > MAX_MB:
-            st.error(f"This file is larger than {MAX_MB} MB. Split it into shorter parts or compress it first.")
-            audio_bytes = None
+st.markdown(
+    """
+<div class="hero">
+<div class="hero-title">🎙️ Meeting Notes Bot</div>
+<div class="hero-sub">Record or upload any meeting or call. Get an accurate transcript and clean notes in seconds.</div>
+<span class="chip">🎧 Voice to text</span>
+<span class="chip">✨ Smart notes</span>
+<span class="chip">✅ Action items</span>
+<span class="chip">💾 Save &amp; download</span>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
-    st.subheader("2. Create transcript and notes")
-    if st.button("Transcribe and write notes", type="primary", disabled=audio_bytes is None):
-        try:
-            with st.spinner("Listening to the audio..."):
-                transcript = transcribe(audio_bytes, filename, language, vocab)
-            if not transcript.strip():
-                st.warning("No speech was found in this audio.")
+tab_new, tab_history = st.tabs(["🎙️ New meeting", "📚 Saved meetings"])
+
+with tab_new:
+    with st.container(border=True):
+        step(1, "📝 Meeting details")
+        col1, col2 = st.columns(2)
+        with col1:
+            title = st.text_input("🏷️ Meeting title", placeholder="Weekly sales review")
+            language = st.selectbox(
+                "🌐 Language spoken", ["Auto-detect", "English", "Hindi", "Marathi"]
+            )
+        with col2:
+            vocab = st.text_area(
+                "🔤 Names and special words (improves accuracy)",
+                placeholder="Responsive Industries, Power BI, DAX, Srinivas",
+                height=122,
+            )
+        context = st.text_input(
+            "💡 Short context for the notes (optional)", placeholder="Call with the export team"
+        )
+
+    with st.container(border=True):
+        step(2, "🎧 Add your audio")
+        rec_col, up_col = st.columns(2)
+        with rec_col:
+            st.markdown("**🎤 Record live**")
+            recorded = st.audio_input("Press the mic to start", label_visibility="collapsed")
+        with up_col:
+            st.markdown("**📁 Upload a recording**")
+            uploaded = st.file_uploader(
+                "Upload a recording",
+                type=["mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac"],
+                label_visibility="collapsed",
+            )
+            st.caption("mp3, wav, m4a, mp4, webm  ·  up to 25 MB")
+
+        audio_bytes, filename = None, None
+        if uploaded is not None:
+            audio_bytes, filename = uploaded.getvalue(), uploaded.name
+        elif recorded is not None:
+            audio_bytes, filename = recorded.getvalue(), "recording.wav"
+
+        if audio_bytes:
+            size_mb = len(audio_bytes) / (1024 * 1024)
+            if size_mb > MAX_MB:
+                st.error(
+                    f"⚠️ This file is {size_mb:.1f} MB, larger than {MAX_MB} MB. "
+                    "Split it into shorter parts or compress it first."
+                )
+                audio_bytes = None
             else:
-                with st.spinner("Writing the notes..."):
-                    notes = make_notes(transcript, context)
-                st.session_state["result"] = {
-                    "title": title.strip() or "Untitled meeting",
-                    "transcript": transcript,
-                    "notes": notes,
-                }
-        except Exception as e:
-            st.error(str(e))
+                st.success(f"🎵 Audio ready: {filename}  ({size_mb:.1f} MB)")
+
+    with st.container(border=True):
+        step(3, "✨ Create your notes")
+        go = st.button(
+            "Transcribe and write notes",
+            type="primary",
+            icon=":material/auto_awesome:",
+            disabled=audio_bytes is None,
+        )
+        if audio_bytes is None:
+            st.caption("Add audio in step 2 to unlock this button.")
+
+        if go:
+            try:
+                with st.spinner("🎧 Listening to the audio..."):
+                    transcript = transcribe(audio_bytes, filename, language, vocab)
+                if not transcript.strip():
+                    st.warning("No speech was found in this audio.")
+                else:
+                    with st.spinner("✍️ Writing the notes..."):
+                        notes = make_notes(transcript, context)
+                    st.session_state["result"] = {
+                        "title": title.strip() or "Untitled meeting",
+                        "transcript": transcript,
+                        "notes": notes,
+                    }
+            except Exception as e:
+                st.error(str(e))
 
     result = st.session_state.get("result")
     if result:
-        st.success("Done. Check the notes against the transcript before relying on them.")
+        st.success("🎉 Done! Check the notes against the transcript before relying on them.")
+
+        stamps = re.findall(r"\[(\d+):(\d\d)\]", result["transcript"])
+        if stamps:
+            last_min, last_sec = int(stamps[-1][0]), int(stamps[-1][1])
+            length_text = f"{last_min}:{last_sec:02d}"
+        else:
+            length_text = "n/a"
+        words = len(re.sub(r"\[\d+:\d\d\]", "", result["transcript"]).split())
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("⏱️ Approx. length", length_text)
+        m2.metric("💬 Words spoken", f"{words:,}")
+        m3.metric("🧾 Transcript lines", len(result["transcript"].splitlines()))
+
         left, right = st.columns(2)
         with left:
-            st.markdown("### Notes")
-            st.markdown(result["notes"])
+            with st.container(border=True):
+                st.markdown("### 📝 Notes")
+                st.markdown(result["notes"])
         with right:
-            st.markdown("### Transcript")
-            st.text_area("Full transcript", result["transcript"], height=400, label_visibility="collapsed")
+            with st.container(border=True):
+                st.markdown("### 🗒️ Transcript")
+                st.text_area(
+                    "Full transcript",
+                    result["transcript"],
+                    height=420,
+                    label_visibility="collapsed",
+                )
 
         b1, b2, b3 = st.columns(3)
-        if b1.button("Save this meeting"):
+        if b1.button("Save this meeting", icon=":material/save:"):
             save_meeting(result["title"], result["transcript"], result["notes"])
-            st.success("Saved.")
+            st.success("💾 Saved. Find it in the Saved meetings tab.")
         b2.download_button(
             "Download notes",
             result["notes"],
             file_name=f"{result['title']}_notes.md",
+            icon=":material/description:",
         )
         b3.download_button(
             "Download transcript",
             result["transcript"],
             file_name=f"{result['title']}_transcript.txt",
+            icon=":material/download:",
         )
 
 with tab_history:
     rows = load_meetings()
     if not rows:
-        st.info("No saved meetings yet.")
+        st.info("📭 No saved meetings yet. Create one in the New meeting tab and press Save.")
     for mid, created, mtitle, mtranscript, mnotes in rows:
-        with st.expander(f"{created}  |  {mtitle}"):
+        with st.expander(f"📝 {mtitle}   ·   🗓️ {created}"):
             st.markdown(mnotes)
             st.text_area("Transcript", mtranscript, height=250, key=f"t{mid}")
             c1, c2 = st.columns(2)
-            c1.download_button("Download notes", mnotes, file_name=f"{mtitle}_notes.md", key=f"d{mid}")
-            if c2.button("Delete", key=f"x{mid}"):
+            c1.download_button(
+                "Download notes",
+                mnotes,
+                file_name=f"{mtitle}_notes.md",
+                key=f"d{mid}",
+                icon=":material/description:",
+            )
+            if c2.button("Delete", key=f"x{mid}", icon=":material/delete:"):
                 delete_meeting(mid)
                 st.rerun()
+
+st.markdown(
+    '<div class="footer">🔒 Your audio is sent only to the speech and notes services. '
+    "Always check important notes against the transcript.</div>",
+    unsafe_allow_html=True,
+)
