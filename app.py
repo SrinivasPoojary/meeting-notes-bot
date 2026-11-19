@@ -124,26 +124,83 @@ def transcribe(audio_bytes, filename, language, vocab):
 
 
 # ---------- notes ----------
+PREFERRED_NOTES_MODELS = [
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
+]
+NOT_CHAT_WORDS = ("whisper", "guard", "tts", "orpheus", "playai", "embed", "safeguard", "distil")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def groq_available_models(key):
+    """Ask Groq which models this account can use right now."""
+    try:
+        resp = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return []
+        return [m["id"] for m in resp.json().get("data", [])]
+    except Exception:
+        return []
+
+
+def notes_model_candidates(key):
+    override = get_secret("GROQ_NOTES_MODEL")
+    available = groq_available_models(key)
+    candidates = [override] if override else []
+    # Our preferred models first, only if Groq says they exist
+    candidates += [m for m in PREFERRED_NOTES_MODELS if m in available]
+    # Then any other chat model on the account
+    candidates += [
+        m for m in available
+        if m not in candidates and not any(w in m.lower() for w in NOT_CHAT_WORDS)
+    ]
+    # If the model list could not be fetched, still try the preferred names
+    if not available:
+        candidates += PREFERRED_NOTES_MODELS
+    return candidates[:6]
+
+
 def make_notes_groq(user_text):
     key = get_secret("GROQ_API_KEY")
-    model = get_secret("GROQ_NOTES_MODEL") or "llama-3.3-70b-versatile"
-    resp = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}"},
-        json={
+    if not key:
+        raise RuntimeError("GROQ_API_KEY is missing. Add it in secrets.")
+    last_error = "No notes model is available on this Groq account."
+    for model in notes_model_candidates(key):
+        payload = {
             "model": model,
             "temperature": 0,
-            "max_tokens": 2000,
+            "max_tokens": 4000,
             "messages": [
                 {"role": "system", "content": NOTES_SYSTEM},
                 {"role": "user", "content": user_text},
             ],
-        },
-        timeout=300,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Notes failed ({resp.status_code}): {resp.text[:300]}")
-    return resp.json()["choices"][0]["message"]["content"]
+        }
+        if model.startswith("openai/gpt-oss"):
+            payload["reasoning_effort"] = "low"
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json=payload,
+            timeout=300,
+        )
+        if resp.status_code == 200:
+            text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
+            if text:
+                return text
+            last_error = f"{model} returned empty notes."
+            continue
+        last_error = f"{model}: {resp.status_code} {resp.text[:200]}"
+        # Try the next model if this one is missing or not allowed
+        if resp.status_code in (400, 403, 404):
+            continue
+        break
+    raise RuntimeError(f"Notes failed. Last error: {last_error}")
 
 
 def make_notes(transcript, context):
