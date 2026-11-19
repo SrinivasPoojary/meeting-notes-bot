@@ -1,6 +1,6 @@
 # AI Voice Recording
 
-**Live app:** [Open AI Voice Recording](https://YOUR-APP-NAME.streamlit.app)
+**Live app:** [Open AI Voice Recording](https://ai-voice-recording.streamlit.app/)
 
 AI Voice Recording turns meetings and calls into a written transcript and clear notes. Record your voice in the browser or upload an audio file, and the app returns the full text with time stamps plus a summary, key points, decisions and action items.
 
