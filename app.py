@@ -231,211 +231,424 @@ def make_notes(transcript, context):
 # ---------- screen ----------
 import re
 
-st.set_page_config(page_title="Meeting Notes Bot", page_icon="🎙️", layout="wide")
+APP_NAME = "AI Voice Recording"
+
+import base64
+import pathlib
+
+import streamlit.components.v1 as components
+
+RECORDER_HTML = r'''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --fg: #111827; --danger: #dc2626; }
+  html, body { margin: 0; padding: 0; background: transparent; color: var(--fg);
+    font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 4px 2px 8px; }
+  .time { font-size: 38px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: 1px; line-height: 1.1; }
+  .status { display: flex; align-items: center; gap: 8px; font-size: 13px; opacity: 0.8; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #9ca3af; }
+  .dot.rec { background: var(--danger); animation: pulse 1.2s infinite; }
+  .dot.pause { background: #f59e0b; }
+  .dot.done { background: #16a34a; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.55); }
+    70% { box-shadow: 0 0 0 9px rgba(220, 38, 38, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0); }
+  }
+  .btns { display: flex; gap: 10px; width: 100%; }
+  button { flex: 1; display: flex; align-items: center; justify-content: center; gap: 8px; border: none;
+    border-radius: 12px; padding: 13px 10px; font-size: 15px; font-weight: 600; cursor: pointer;
+    color: #ffffff; font-family: inherit; transition: transform 0.12s ease, opacity 0.12s ease; }
+  button:hover:not(:disabled) { transform: translateY(-1px); }
+  #main { background: linear-gradient(135deg, #2563eb, #4f46e5); flex: 2; }
+  #stop { background: #dc2626; }
+  button:disabled { opacity: 0.35; cursor: not-allowed; }
+  svg { width: 18px; height: 18px; fill: currentColor; }
+  audio { width: 100%; height: 38px; display: none; }
+  .err { color: var(--danger); font-size: 13px; text-align: center; min-height: 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="time" id="time">00:00</div>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">Ready</span></div>
+  <div class="btns">
+    <button id="main"></button>
+    <button id="stop"></button>
+  </div>
+  <audio id="player" controls></audio>
+  <div class="err" id="err"></div>
+</div>
+<script>
+  var ICON_REC = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"></circle></svg>';
+  var ICON_PAUSE = '<svg viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"></rect><rect x="14" y="5" width="4" height="14" rx="1"></rect></svg>';
+  var ICON_PLAY = '<svg viewBox="0 0 24 24"><polygon points="7,4 20,12 7,20"></polygon></svg>';
+  var ICON_STOP = '<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>';
+
+  function post(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
+  }
+  function setHeight() {
+    post("streamlit:setFrameHeight", { height: document.documentElement.scrollHeight });
+  }
+  function sendValue(value) {
+    post("streamlit:setComponentValue", { value: value, dataType: "json" });
+  }
+  function $(id) { return document.getElementById(id); }
+
+  var state = "idle";   // idle, recording, paused, done
+  var recorder = null, stream = null, chunks = [], mime = "";
+  var startedAt = 0, acc = 0, timer = null, lastUrl = null;
+
+  function pickMime() {
+    var options = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+    if (!window.MediaRecorder) return "";
+    for (var i = 0; i < options.length; i++) {
+      if (MediaRecorder.isTypeSupported(options[i])) return options[i];
+    }
+    return "";
+  }
+  function extFor(type) {
+    if (type.indexOf("mp4") !== -1) return "mp4";
+    if (type.indexOf("ogg") !== -1) return "ogg";
+    return "webm";
+  }
+  function fmt(ms) {
+    var s = Math.floor(ms / 1000);
+    var m = Math.floor(s / 60);
+    var r = s % 60;
+    return (m < 10 ? "0" : "") + m + ":" + (r < 10 ? "0" : "") + r;
+  }
+  function elapsed() { return acc + (state === "recording" ? Date.now() - startedAt : 0); }
+  function tick() { $("time").textContent = fmt(elapsed()); }
+
+  function render() {
+    var main = $("main"), stop = $("stop"), dot = $("dot"), status = $("status");
+    stop.innerHTML = ICON_STOP + "<span>Stop</span>";
+    dot.className = "dot";
+    if (state === "idle") {
+      main.innerHTML = ICON_REC + "<span>Record</span>";
+      stop.disabled = true; status.textContent = "Ready";
+    } else if (state === "recording") {
+      main.innerHTML = ICON_PAUSE + "<span>Pause</span>";
+      stop.disabled = false; status.textContent = "Recording"; dot.className = "dot rec";
+    } else if (state === "paused") {
+      main.innerHTML = ICON_PLAY + "<span>Resume</span>";
+      stop.disabled = false; status.textContent = "Paused"; dot.className = "dot pause";
+    } else {
+      main.innerHTML = ICON_REC + "<span>Record again</span>";
+      stop.disabled = true; status.textContent = "Recording saved"; dot.className = "dot done";
+    }
+    tick();
+    setHeight();
+  }
+
+  async function start() {
+    $("err").textContent = "";
+    if (!navigator.mediaDevices || !window.MediaRecorder) {
+      $("err").textContent = "This browser cannot record audio. Please use Chrome.";
+      setHeight();
+      return;
+    }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    } catch (e) {
+      $("err").textContent = "Microphone access is blocked. Allow the microphone in your browser settings and try again.";
+      setHeight();
+      return;
+    }
+    mime = pickMime();
+    chunks = [];
+    acc = 0;
+    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    recorder.ondataavailable = function (e) { if (e.data && e.data.size > 0) chunks.push(e.data); };
+    recorder.onstop = finish;
+    recorder.start(1000);
+    startedAt = Date.now();
+    state = "recording";
+    clearInterval(timer);
+    timer = setInterval(tick, 250);
+    $("player").style.display = "none";
+    sendValue(null);
+    render();
+  }
+  function pause() {
+    recorder.pause();
+    acc += Date.now() - startedAt;
+    state = "paused";
+    render();
+  }
+  function resume() {
+    recorder.resume();
+    startedAt = Date.now();
+    state = "recording";
+    render();
+  }
+  function stopRec() {
+    if (state === "recording") { acc += Date.now() - startedAt; }
+    state = "done";
+    clearInterval(timer);
+    try { recorder.stop(); } catch (e) {}
+    if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); }
+    render();
+  }
+  function finish() {
+    var fullType = recorder.mimeType || mime || "audio/webm";
+    var blob = new Blob(chunks, { type: fullType });
+    if (lastUrl) { URL.revokeObjectURL(lastUrl); }
+    lastUrl = URL.createObjectURL(blob);
+    var player = $("player");
+    player.src = lastUrl;
+    player.style.display = "block";
+    setHeight();
+    var reader = new FileReader();
+    reader.onloadend = function () {
+      var b64 = String(reader.result).split(",")[1] || "";
+      sendValue({ audio: b64, ext: extFor(fullType), mime: fullType.split(";")[0], seconds: Math.round(acc / 1000), id: Date.now() });
+    };
+    reader.readAsDataURL(blob);
+  }
+
+  $("main").onclick = function () {
+    if (state === "idle" || state === "done") start();
+    else if (state === "recording") pause();
+    else if (state === "paused") resume();
+  };
+  $("stop").onclick = stopRec;
+
+  window.addEventListener("message", function (event) {
+    if (event.data && event.data.type === "streamlit:render") {
+      var theme = event.data.theme;
+      if (theme && theme.textColor) {
+        document.documentElement.style.setProperty("--fg", theme.textColor);
+      }
+      setHeight();
+    }
+  });
+
+  render();
+  post("streamlit:componentReady", { apiVersion: 1 });
+  setHeight();
+</script>
+</body>
+</html>
+'''
+
+RECORDER_DIR = pathlib.Path(__file__).parent / "voice_recorder_component"
+RECORDER_DIR.mkdir(exist_ok=True)
+_recorder_file = RECORDER_DIR / "index.html"
+if not _recorder_file.exists() or _recorder_file.read_text(encoding="utf-8") != RECORDER_HTML:
+    _recorder_file.write_text(RECORDER_HTML, encoding="utf-8")
+
+voice_recorder = components.declare_component("voice_recorder", path=str(RECORDER_DIR))
+
+st.set_page_config(page_title=APP_NAME, page_icon="🎙️", layout="centered")
 
 st.markdown(
     """
 <style>
-#MainMenu, footer {visibility: hidden;}
-.block-container {padding-top: 1.6rem; max-width: 1100px;}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-.hero {
-  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 45%, #ec4899 100%);
-  border-radius: 24px; padding: 30px 32px; margin-bottom: 22px;
-  box-shadow: 0 14px 34px rgba(124, 58, 237, 0.35);
-}
-.hero-title {font-size: 2.3rem; font-weight: 800; color: #ffffff; line-height: 1.15;}
-.hero-sub {font-size: 1.05rem; color: rgba(255,255,255,0.92); margin: 8px 0 16px 0;}
-.chip {
-  display: inline-block; padding: 6px 14px; margin: 0 8px 8px 0; border-radius: 999px;
-  background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.35);
-  color: #ffffff; font-size: 0.88rem; font-weight: 600;
-}
+html, body, .stApp, button, input, textarea, select {font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif !important;}
+#MainMenu, footer, header[data-testid="stHeader"] {visibility: hidden; height: 0;}
+.block-container {padding: 1.1rem 1rem 3rem 1rem; max-width: 900px;}
 
-.step {display: flex; align-items: center; gap: 12px; margin: 4px 0 10px 0;}
-.step .num {
-  width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
-  background: linear-gradient(135deg, #6366f1, #ec4899); color: #ffffff;
-  display: flex; align-items: center; justify-content: center; font-weight: 800;
-  box-shadow: 0 4px 12px rgba(236, 72, 153, 0.35);
-}
-.step .label {font-size: 1.25rem; font-weight: 700;}
+.topbar {display: flex; align-items: center; gap: 14px; background: #0f172a; border-radius: 18px; padding: 16px 20px; margin-bottom: 18px;}
+.logo {width: 46px; height: 46px; border-radius: 13px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #ffffff; background: linear-gradient(135deg, #2563eb, #4f46e5);}
+.brand {color: #ffffff; font-weight: 700; font-size: 1.3rem; line-height: 1.2; letter-spacing: -0.2px;}
+.tagline {color: #94a3b8; font-size: 0.85rem; margin-top: 2px;}
 
-div[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 18px;}
+.sec {display: flex; align-items: center; gap: 12px; margin-bottom: 12px;}
+.sec .ico {width: 38px; height: 38px; border-radius: 11px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #2563eb; background: rgba(37, 99, 235, 0.12);}
+.sec .t {font-weight: 650; font-size: 1.05rem; line-height: 1.2;}
+.sec .s {font-size: 0.82rem; opacity: 0.65; margin-top: 2px;}
 
-.stButton > button, .stDownloadButton > button {
-  width: 100%; border-radius: 12px; font-weight: 600; padding: 0.6rem 1rem;
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
-}
-.stButton > button:hover, .stDownloadButton > button:hover {
-  transform: translateY(-2px); box-shadow: 0 8px 18px rgba(99, 102, 241, 0.28);
-}
-.stButton > button[kind="primary"], button[data-testid="stBaseButton-primary"] {
-  background: linear-gradient(135deg, #6366f1, #8b5cf6 50%, #ec4899);
-  color: #ffffff; border: none; font-size: 1.05rem; padding: 0.75rem 1rem;
-}
-.stButton > button[kind="primary"]:disabled, button[data-testid="stBaseButton-primary"]:disabled {
-  opacity: 0.45;
-}
+div[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 16px;}
 
-div[data-testid="stMetric"] {
-  background: rgba(127, 127, 127, 0.10); border: 1px solid rgba(127, 127, 127, 0.22);
-  padding: 14px 18px; border-radius: 16px;
-}
-button[data-baseweb="tab"] {font-size: 1.05rem; font-weight: 700;}
-.footer {text-align: center; opacity: 0.6; font-size: 0.9rem; margin-top: 28px;}
+div[data-baseweb="tab-list"] {gap: 6px; background: rgba(127, 127, 127, 0.13); padding: 5px; border-radius: 13px;}
+button[data-baseweb="tab"] {flex: 1; border-radius: 9px; height: auto; padding: 9px 16px;}
+button[data-baseweb="tab"] p {font-weight: 600; font-size: 0.97rem;}
+button[data-baseweb="tab"][aria-selected="true"] {background: #2563eb;}
+button[data-baseweb="tab"][aria-selected="true"] p {color: #ffffff;}
+div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] {display: none;}
+
+div[data-baseweb="input"], div[data-baseweb="textarea"], div[data-baseweb="select"] > div {border-radius: 10px;}
+
+.stButton > button, .stDownloadButton > button {width: 100%; border-radius: 12px; font-weight: 600; padding: 0.7rem 1rem; border: 1px solid rgba(127, 127, 127, 0.32); transition: transform 0.12s ease, box-shadow 0.12s ease;}
+.stButton > button:hover, .stDownloadButton > button:hover {transform: translateY(-1px); box-shadow: 0 6px 16px rgba(37, 99, 235, 0.22);}
+.stButton > button[kind="primary"], button[data-testid="stBaseButton-primary"] {color: #ffffff; border: none; font-size: 1.02rem; padding: 0.85rem 1rem; background: linear-gradient(135deg, #2563eb, #4f46e5);}
+.stButton > button[kind="primary"] p, button[data-testid="stBaseButton-primary"] p {color: #ffffff;}
+.stButton > button[kind="primary"]:disabled, button[data-testid="stBaseButton-primary"]:disabled {opacity: 0.4;}
+
+div[data-testid="stMetric"] {background: rgba(127, 127, 127, 0.09); border: 1px solid rgba(127, 127, 127, 0.2); padding: 14px 18px; border-radius: 14px;}
+div[data-testid="stMetricLabel"] p {font-size: 0.82rem; opacity: 0.7;}
+
+.empty {text-align: center; padding: 42px 16px; border: 1px dashed rgba(127, 127, 127, 0.4); border-radius: 16px;}
+.empty .ico {display: inline-flex; width: 54px; height: 54px; border-radius: 16px; align-items: center; justify-content: center; color: #2563eb; background: rgba(37, 99, 235, 0.12); margin-bottom: 10px;}
+.empty .t {font-weight: 650; font-size: 1.05rem;}
+.empty .s {font-size: 0.88rem; opacity: 0.65; margin-top: 4px;}
+.note {text-align: center; font-size: 0.8rem; opacity: 0.55; margin-top: 26px;}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
+ICONS = {
+    "mic": '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>',
+    "sliders": '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
+    "file": '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>',
+    "list": '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>',
+    "folder": '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>',
+    "check": '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>',
+}
 
-def step(number, text):
+
+def svg(name, size=20):
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" '
+        f'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+        f'stroke-linejoin="round">{ICONS[name]}</svg>'
+    )
+
+
+def section(icon, title, subtitle):
     st.markdown(
-        f'<div class="step"><div class="num">{number}</div><div class="label">{text}</div></div>',
+        f'<div class="sec"><div class="ico">{svg(icon)}</div>'
+        f'<div><div class="t">{title}</div><div class="s">{subtitle}</div></div></div>',
         unsafe_allow_html=True,
     )
 
 
 st.markdown(
-    """
-<div class="hero">
-<div class="hero-title">🎙️ Meeting Notes Bot</div>
-<div class="hero-sub">Record or upload any meeting or call. Get an accurate transcript and clean notes in seconds.</div>
-<span class="chip">🎧 Voice to text</span>
-<span class="chip">✨ Smart notes</span>
-<span class="chip">✅ Action items</span>
-<span class="chip">💾 Save &amp; download</span>
-</div>
-""",
+    f'<div class="topbar"><div class="logo">{svg("mic", 24)}</div>'
+    f'<div><div class="brand">{APP_NAME}</div>'
+    f'<div class="tagline">Record, transcribe and summarize your meetings</div></div></div>',
     unsafe_allow_html=True,
 )
 
-tab_new, tab_history = st.tabs(["🎙️ New meeting", "📚 Saved meetings"])
+tab_new, tab_history = st.tabs(["New recording", "Library"])
 
 with tab_new:
     with st.container(border=True):
-        step(1, "📝 Meeting details")
-        col1, col2 = st.columns(2)
-        with col1:
-            title = st.text_input("🏷️ Meeting title", placeholder="Weekly sales review")
-            language = st.selectbox(
-                "🌐 Language spoken", ["Auto-detect", "English", "Hindi", "Marathi"]
-            )
-        with col2:
-            vocab = st.text_area(
-                "🔤 Names and special words (improves accuracy)",
-                placeholder="Responsive Industries, Power BI, DAX, Srinivas",
-                height=122,
-            )
-        context = st.text_input(
-            "💡 Short context for the notes (optional)", placeholder="Call with the export team"
-        )
-
-    with st.container(border=True):
-        step(2, "🎧 Add your audio")
+        section("mic", "Audio", "Record live or upload a file")
         rec_col, up_col = st.columns(2)
         with rec_col:
-            st.markdown("**🎤 Record live**")
-            recorded = st.audio_input("Press the mic to start", label_visibility="collapsed")
+            st.caption("Record")
+            recorded = voice_recorder(key="voice_recorder", default=None)
         with up_col:
-            st.markdown("**📁 Upload a recording**")
+            st.caption("Upload")
             uploaded = st.file_uploader(
-                "Upload a recording",
+                "Upload",
                 type=["mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac"],
                 label_visibility="collapsed",
             )
-            st.caption("mp3, wav, m4a, mp4, webm  ·  up to 25 MB")
 
         audio_bytes, filename = None, None
         if uploaded is not None:
             audio_bytes, filename = uploaded.getvalue(), uploaded.name
-        elif recorded is not None:
-            audio_bytes, filename = recorded.getvalue(), "recording.wav"
+        elif isinstance(recorded, dict) and recorded.get("audio"):
+            audio_bytes = base64.b64decode(recorded["audio"])
+            filename = f"recording.{recorded.get('ext', 'webm')}"
 
         if audio_bytes:
             size_mb = len(audio_bytes) / (1024 * 1024)
             if size_mb > MAX_MB:
                 st.error(
-                    f"⚠️ This file is {size_mb:.1f} MB, larger than {MAX_MB} MB. "
+                    f"This file is {size_mb:.1f} MB, which is larger than the {MAX_MB} MB limit. "
                     "Split it into shorter parts or compress it first."
                 )
                 audio_bytes = None
             else:
-                st.success(f"🎵 Audio ready: {filename}  ({size_mb:.1f} MB)")
+                st.success(f"Audio ready: {filename} ({size_mb:.1f} MB)")
 
     with st.container(border=True):
-        step(3, "✨ Create your notes")
-        go = st.button(
-            "Transcribe and write notes",
-            type="primary",
-            icon=":material/auto_awesome:",
-            disabled=audio_bytes is None,
+        section("sliders", "Details", "Helps the transcript and notes come out right")
+        c1, c2 = st.columns(2)
+        with c1:
+            title = st.text_input("Title")
+            language = st.selectbox("Language spoken", ["Auto-detect", "English", "Hindi", "Marathi"])
+        with c2:
+            vocab = st.text_area(
+                "Names and special words",
+                height=122,
+                help="Add names, brands and technical terms that may be heard wrongly. This improves spelling.",
+            )
+        context = st.text_input(
+            "Context for the notes",
+            help="Optional. One short line about what this recording is.",
         )
-        if audio_bytes is None:
-            st.caption("Add audio in step 2 to unlock this button.")
 
-        if go:
+    go = st.button(
+        "Transcribe and write notes",
+        type="primary",
+        icon=":material/auto_awesome:",
+        disabled=audio_bytes is None,
+    )
+
+    if go:
+        with st.status("Processing your recording", expanded=True) as status:
             try:
-                with st.spinner("🎧 Listening to the audio..."):
-                    transcript = transcribe(audio_bytes, filename, language, vocab)
+                st.write("Transcribing audio...")
+                transcript = transcribe(audio_bytes, filename, language, vocab)
                 if not transcript.strip():
+                    status.update(label="No speech found", state="error", expanded=True)
                     st.warning("No speech was found in this audio.")
                 else:
-                    with st.spinner("✍️ Writing the notes..."):
-                        notes = make_notes(transcript, context)
+                    st.write("Writing notes...")
+                    notes = make_notes(transcript, context)
                     st.session_state["result"] = {
-                        "title": title.strip() or "Untitled meeting",
+                        "title": title.strip() or "Untitled recording",
                         "transcript": transcript,
                         "notes": notes,
                     }
+                    status.update(label="Finished", state="complete", expanded=False)
             except Exception as e:
+                status.update(label="Something went wrong", state="error", expanded=True)
                 st.error(str(e))
 
     result = st.session_state.get("result")
     if result:
-        st.success("🎉 Done! Check the notes against the transcript before relying on them.")
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        section("check", "Results", "Check the notes against the transcript before relying on them")
 
         stamps = re.findall(r"\[(\d+):(\d\d)\]", result["transcript"])
-        if stamps:
-            last_min, last_sec = int(stamps[-1][0]), int(stamps[-1][1])
-            length_text = f"{last_min}:{last_sec:02d}"
-        else:
-            length_text = "n/a"
+        length_text = f"{int(stamps[-1][0])}:{int(stamps[-1][1]):02d}" if stamps else "n/a"
         words = len(re.sub(r"\[\d+:\d\d\]", "", result["transcript"]).split())
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("⏱️ Approx. length", length_text)
-        m2.metric("💬 Words spoken", f"{words:,}")
-        m3.metric("🧾 Transcript lines", len(result["transcript"].splitlines()))
+        m1.metric("Length", length_text)
+        m2.metric("Words", f"{words:,}")
+        m3.metric("Segments", len(result["transcript"].splitlines()))
 
-        left, right = st.columns(2)
-        with left:
-            with st.container(border=True):
-                st.markdown("### 📝 Notes")
-                st.markdown(result["notes"])
-        with right:
-            with st.container(border=True):
-                st.markdown("### 🗒️ Transcript")
-                st.text_area(
-                    "Full transcript",
-                    result["transcript"],
-                    height=420,
-                    label_visibility="collapsed",
-                )
+        with st.container(border=True):
+            section("list", "Notes", result["title"])
+            st.markdown(result["notes"])
+
+        with st.container(border=True):
+            section("file", "Transcript", "Full text with time stamps")
+            st.text_area(
+                "Full transcript",
+                result["transcript"],
+                height=360,
+                label_visibility="collapsed",
+            )
 
         b1, b2, b3 = st.columns(3)
-        if b1.button("Save this meeting", icon=":material/save:"):
+        if b1.button("Save", icon=":material/save:"):
             save_meeting(result["title"], result["transcript"], result["notes"])
-            st.success("💾 Saved. Find it in the Saved meetings tab.")
+            st.success("Saved to your Library.")
         b2.download_button(
-            "Download notes",
+            "Notes",
             result["notes"],
             file_name=f"{result['title']}_notes.md",
-            icon=":material/description:",
+            icon=":material/download:",
         )
         b3.download_button(
-            "Download transcript",
+            "Transcript",
             result["transcript"],
             file_name=f"{result['title']}_transcript.txt",
             icon=":material/download:",
@@ -444,25 +657,29 @@ with tab_new:
 with tab_history:
     rows = load_meetings()
     if not rows:
-        st.info("📭 No saved meetings yet. Create one in the New meeting tab and press Save.")
+        st.markdown(
+            f'<div class="empty"><div class="ico">{svg("folder", 26)}</div>'
+            '<div class="t">No saved recordings yet</div>'
+            '<div class="s">Recordings you save will appear here.</div></div>',
+            unsafe_allow_html=True,
+        )
     for mid, created, mtitle, mtranscript, mnotes in rows:
-        with st.expander(f"📝 {mtitle}   ·   🗓️ {created}"):
+        with st.expander(f"{mtitle}  |  {created}"):
             st.markdown(mnotes)
-            st.text_area("Transcript", mtranscript, height=250, key=f"t{mid}")
+            st.text_area("Transcript", mtranscript, height=240, key=f"t{mid}")
             c1, c2 = st.columns(2)
             c1.download_button(
                 "Download notes",
                 mnotes,
                 file_name=f"{mtitle}_notes.md",
                 key=f"d{mid}",
-                icon=":material/description:",
+                icon=":material/download:",
             )
             if c2.button("Delete", key=f"x{mid}", icon=":material/delete:"):
                 delete_meeting(mid)
                 st.rerun()
 
 st.markdown(
-    '<div class="footer">🔒 Your audio is sent only to the speech and notes services. '
-    "Always check important notes against the transcript.</div>",
+    '<div class="note">Always check important notes against the transcript.</div>',
     unsafe_allow_html=True,
 )
